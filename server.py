@@ -1,7 +1,4 @@
-from starlette.applications import Starlette
-from starlette.routing import Route, Mount
 from starlette.responses import JSONResponse
-from starlette.middleware import Middleware
 import uvicorn
 from fastmcp import FastMCP
 import os
@@ -554,6 +551,40 @@ class _BrowserFallbackMiddleware:
 
 _mcp_asgi = mcp.streamable_http_app()
 app = _BrowserFallbackMiddleware(_mcp_asgi)
+
+
+
+# Browser-friendly entrypoint
+class _BrowserFallback:
+    def __init__(self, app):
+        self.app = app
+    async def __call__(self, scope, receive, send):
+        if (scope["type"] == "http"
+            and scope["path"] == "/mcp"
+            and scope["method"] == "GET"):
+            headers = dict(scope.get("headers", []))
+            accept = headers.get(b"accept", b"").decode()
+            if "text/event-stream" not in accept:
+                tools = []
+                try:
+                    for t in mcp._tool_manager._tools.values():
+                        tools.append({"name": t.name, "description": t.description or ""})
+                except Exception:
+                    pass
+                resp = JSONResponse({
+                    "server": mcp.name,
+                    "protocol": "MCP (Model Context Protocol)",
+                    "transport": "streamable-http",
+                    "endpoint": "/mcp",
+                    "tools": tools,
+                    "tool_count": len(tools),
+                    "usage": "Connect with an MCP client (Claude Desktop, Cursor, etc.) using this URL."
+                })
+                await resp(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+app = _BrowserFallback(mcp.http_app())
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
