@@ -1,57 +1,17 @@
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from starlette.responses import JSONResponse
+from starlette.middleware import Middleware
 import uvicorn
 from fastmcp import FastMCP
-import asyncio
 import os
 import subprocess
-import shutil
-from typing import Optional
+import asyncio
+import json
+from typing import Optional, List
+from pathlib import Path
 
-mcp = FastMCP("ferretdb")
-
-
-def _run_subprocess(args: list[str], timeout: int = 60) -> dict:
-    """Run a subprocess and return structured output."""
-    try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-        return {
-            "success": result.returncode == 0,
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "command": " ".join(args)
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "success": False,
-            "returncode": -1,
-            "stdout": "",
-            "stderr": f"Command timed out after {timeout} seconds",
-            "command": " ".join(args)
-        }
-    except FileNotFoundError as e:
-        return {
-            "success": False,
-            "returncode": -1,
-            "stdout": "",
-            "stderr": f"Binary not found: {e}",
-            "command": " ".join(args)
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "returncode": -1,
-            "stdout": "",
-            "stderr": str(e),
-            "command": " ".join(args)
-        }
+mcp = FastMCP("FerretDB")
 
 
 @mcp.tool()
@@ -60,536 +20,504 @@ async def run_ferretdb_server(
     postgresql_url: Optional[str] = None,
     log_level: str = "info",
     tls: bool = False,
-    extra_flags: Optional[list] = None
+    extra_flags: Optional[List[str]] = None,
 ) -> dict:
     """
     Start the FerretDB server process with specified configuration.
     Use this when you need to launch FerretDB as a MongoDB-compatible proxy
-    connected to a PostgreSQL/DocumentDB backend. Supports configuring listen
-    addresses, backend connection strings, TLS, logging, and other server options.
+    backed by PostgreSQL with DocumentDB extension. Supports configuring
+    listen address, backend, logging, and TLS options.
     """
-    args = ["ferretdb"]
+    cmd = ["ferretdb"]
 
-    if listen_addr:
-        args.extend([f"--listen-addr={listen_addr}"])
+    cmd.append(f"--listen-addr={listen_addr}")
+    cmd.append(f"--log-level={log_level}")
 
     if postgresql_url:
-        args.extend([f"--postgresql-url={postgresql_url}"])
-
-    if log_level:
-        args.extend([f"--log-level={log_level}"])
+        cmd.append(f"--postgresql-url={postgresql_url}")
 
     if tls:
-        args.append("--tls")
+        cmd.append("--tls")
 
     if extra_flags:
-        args.extend(extra_flags)
+        cmd.extend(extra_flags)
 
-    # Check if ferretdb binary exists
-    ferretdb_bin = shutil.which("ferretdb")
-    if not ferretdb_bin:
-        # Try common build output paths
-        for candidate in ["./ferretdb", "./bin/ferretdb", "./build/ferretdb"]:
-            if os.path.isfile(candidate):
-                args[0] = candidate
-                ferretdb_bin = candidate
-                break
-
-    if not ferretdb_bin and args[0] == "ferretdb":
-        return {
-            "success": False,
-            "error": "ferretdb binary not found in PATH or common build directories",
-            "attempted_command": " ".join(args),
-            "suggestion": "Build FerretDB first with 'go build ./cmd/ferretdb/...' or ensure the binary is in PATH"
-        }
-
-    # Start the process in background (non-blocking)
     try:
-        process = subprocess.Popen(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        # Give it a moment to start or fail immediately
-        await asyncio.sleep(1)
-        poll_result = process.poll()
-        if poll_result is not None:
-            stdout, stderr = process.communicate(timeout=5)
+
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5.0)
             return {
-                "success": False,
-                "pid": None,
-                "returncode": poll_result,
-                "stdout": stdout,
-                "stderr": stderr,
-                "command": " ".join(args),
-                "message": "FerretDB process exited immediately"
+                "status": "exited",
+                "pid": process.pid,
+                "returncode": process.returncode,
+                "stdout": stdout.decode(errors="replace"),
+                "stderr": stderr.decode(errors="replace"),
+                "command": " ".join(cmd),
             }
-        return {
-            "success": True,
-            "pid": process.pid,
-            "command": " ".join(args),
-            "listen_addr": listen_addr,
-            "postgresql_url": postgresql_url,
-            "log_level": log_level,
-            "tls_enabled": tls,
-            "message": f"FerretDB server started with PID {process.pid}. Use kill {process.pid} to stop it."
-        }
+        except asyncio.TimeoutError:
+            return {
+                "status": "running",
+                "pid": process.pid,
+                "message": "FerretDB process started and is running (did not exit within 5s timeout)",
+                "command": " ".join(cmd),
+                "listen_addr": listen_addr,
+                "log_level": log_level,
+                "tls_enabled": tls,
+                "postgresql_url": postgresql_url or "(not set)",
+            }
     except FileNotFoundError:
         return {
-            "success": False,
-            "error": f"Binary not found: {args[0]}",
-            "command": " ".join(args)
+            "status": "error",
+            "error": "ferretdb binary not found. Please ensure FerretDB is installed and available in PATH.",
+            "command": " ".join(cmd),
         }
     except Exception as e:
         return {
-            "success": False,
+            "status": "error",
             "error": str(e),
-            "command": " ".join(args)
+            "command": " ".join(cmd),
         }
 
 
 @mcp.tool()
-async def setup_environment(
+async def setup_test_environment(
     compose_file: Optional[str] = None,
-    verbose: bool = False,
-    skip_pull: bool = False
+    timeout_seconds: int = 300,
+    log_level: str = "info",
 ) -> dict:
     """
-    Run the envtool setup subcommand to initialize and configure the development
-    or test environment. Use this to prepare Docker services, check dependencies,
-    and ensure all required infrastructure (PostgreSQL, DocumentDB extension, etc.)
-    is ready before running tests or the server.
+    Run the envtool setup subcommand to prepare the development/test environment.
+    This configures Docker Compose services, waits for dependencies to be healthy,
+    and sets up required infrastructure before running tests.
     """
-    # Find envtool binary
-    envtool_bin = shutil.which("envtool")
-    if not envtool_bin:
-        for candidate in ["./envtool", "./bin/envtool", "./cmd/envtool/envtool"]:
-            if os.path.isfile(candidate):
-                envtool_bin = candidate
-                break
+    cmd = ["go", "run", "./cmd/envtool", "setup"]
 
-    if not envtool_bin:
-        # Fall back to go run
-        envtool_bin = None
-
-    if envtool_bin:
-        args = [envtool_bin, "setup"]
-    else:
-        args = ["go", "run", "./cmd/envtool", "setup"]
-
-    if verbose:
-        args.append("--verbose")
-
-    if skip_pull:
-        args.append("--skip-pull")
+    cmd.append(f"--log-level={log_level}")
 
     if compose_file:
-        args.extend(["--compose-file", compose_file])
+        cmd.append(f"--compose-file={compose_file}")
 
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, lambda: _run_subprocess(args, timeout=300))
-    result["tool"] = "setup_environment"
-    result["config"] = {
-        "compose_file": compose_file,
-        "verbose": verbose,
-        "skip_pull": skip_pull
-    }
-    return result
+    env = os.environ.copy()
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=float(timeout_seconds)
+            )
+            success = process.returncode == 0
+            return {
+                "status": "success" if success else "failed",
+                "returncode": process.returncode,
+                "stdout": stdout.decode(errors="replace"),
+                "stderr": stderr.decode(errors="replace"),
+                "command": " ".join(cmd),
+            }
+        except asyncio.TimeoutError:
+            process.kill()
+            return {
+                "status": "timeout",
+                "error": f"Setup timed out after {timeout_seconds} seconds",
+                "command": " ".join(cmd),
+            }
+    except FileNotFoundError:
+        return {
+            "status": "error",
+            "error": "'go' binary not found. Please ensure Go is installed and available in PATH.",
+            "command": " ".join(cmd),
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "command": " ".join(cmd),
+        }
 
 
 @mcp.tool()
 async def run_tests(
-    packages: Optional[list] = None,
-    run_filter: Optional[str] = None,
-    timeout: str = "10m",
-    tags: Optional[list] = None,
-    short: bool = False,
-    count: int = 1,
-    verbose: bool = False
+    packages: List[str],
+    run_pattern: Optional[str] = None,
+    parallel: Optional[int] = None,
+    timeout_seconds: int = 600,
+    verbose: bool = False,
+    tags: Optional[List[str]] = None,
 ) -> dict:
     """
-    Execute Go tests using the envtool test runner, which provides enhanced output
-    formatting, panic recovery, and structured logging. Use this to run unit tests,
-    integration tests, or specific test packages with proper test filtering and
-    output handling.
+    Execute Go tests via envtool's test runner, which provides enhanced output
+    formatting, parallel test control, and proper exit code handling.
     """
-    if packages is None:
-        packages = ["./..."]
+    cmd = ["go", "run", "./cmd/envtool", "tests", "run"]
 
-    # Find envtool binary
-    envtool_bin = shutil.which("envtool")
-    if not envtool_bin:
-        for candidate in ["./envtool", "./bin/envtool"]:
-            if os.path.isfile(candidate):
-                envtool_bin = candidate
-                break
+    if run_pattern:
+        cmd.append(f"--run={run_pattern}")
 
-    if envtool_bin:
-        args = [envtool_bin, "test"]
-    else:
-        args = ["go", "run", "./cmd/envtool", "test"]
-
-    if run_filter:
-        args.extend(["--run", run_filter])
-
-    if timeout:
-        args.extend(["--timeout", timeout])
-
-    if tags:
-        args.extend(["--tags", ",".join(tags)])
-
-    if short:
-        args.append("--short")
-
-    if count and count != 1:
-        args.extend(["--count", str(count)])
+    if parallel is not None:
+        cmd.append(f"--parallel={parallel}")
 
     if verbose:
-        args.append("-v")
+        cmd.append("--verbose")
 
-    args.extend(packages)
+    if tags:
+        cmd.append(f"--tags={','.join(tags)}")
 
-    # Parse timeout string to seconds for subprocess timeout
-    timeout_seconds = 600
+    cmd.append(f"--timeout={timeout_seconds}s")
+
+    cmd.extend(packages)
+
     try:
-        if timeout.endswith("h"):
-            timeout_seconds = int(timeout[:-1]) * 3600
-        elif timeout.endswith("m"):
-            timeout_seconds = int(timeout[:-1]) * 60
-        elif timeout.endswith("s"):
-            timeout_seconds = int(timeout[:-1])
-    except (ValueError, IndexError):
-        timeout_seconds = 600
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
-    # Add buffer for process overhead
-    subprocess_timeout = timeout_seconds + 60
-
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, lambda: _run_subprocess(args, timeout=subprocess_timeout))
-    result["tool"] = "run_tests"
-    result["config"] = {
-        "packages": packages,
-        "run_filter": run_filter,
-        "timeout": timeout,
-        "tags": tags,
-        "short": short,
-        "count": count,
-        "verbose": verbose
-    }
-    return result
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=float(timeout_seconds + 60)
+            )
+            success = process.returncode == 0
+            return {
+                "status": "success" if success else "failed",
+                "returncode": process.returncode,
+                "stdout": stdout.decode(errors="replace"),
+                "stderr": stderr.decode(errors="replace"),
+                "command": " ".join(cmd),
+                "packages": packages,
+            }
+        except asyncio.TimeoutError:
+            process.kill()
+            return {
+                "status": "timeout",
+                "error": f"Tests timed out after {timeout_seconds} seconds",
+                "command": " ".join(cmd),
+            }
+    except FileNotFoundError:
+        return {
+            "status": "error",
+            "error": "'go' binary not found. Please ensure Go is installed and available in PATH.",
+            "command": " ".join(cmd),
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "command": " ".join(cmd),
+        }
 
 
 @mcp.tool()
 async def run_fuzz(
     fuzz_target: str,
     package: str,
-    fuzz_time: str = "30s",
-    corpus_dir: Optional[str] = None
+    duration_seconds: int = 60,
+    corpus_dir: Optional[str] = None,
 ) -> dict:
     """
-    Execute Go fuzz tests using the envtool fuzz subcommand. Use this to run
-    fuzzing campaigns against FerretDB to discover edge cases and bugs in protocol
-    handling or BSON parsing. Supports selecting specific fuzz targets and
-    controlling duration.
+    Execute fuzz testing via envtool's fuzz subcommand against FerretDB components.
+    Runs Go fuzz targets for a specified duration to discover edge cases and crashes
+    in protocol parsing or query handling.
     """
-    # Find envtool binary
-    envtool_bin = shutil.which("envtool")
-    if not envtool_bin:
-        for candidate in ["./envtool", "./bin/envtool"]:
-            if os.path.isfile(candidate):
-                envtool_bin = candidate
-                break
-
-    if envtool_bin:
-        args = [envtool_bin, "fuzz"]
-    else:
-        args = ["go", "run", "./cmd/envtool", "fuzz"]
-
-    args.extend(["--fuzz", fuzz_target])
-    args.extend(["--fuzz-time", fuzz_time])
+    cmd = [
+        "go",
+        "test",
+        f"-fuzz={fuzz_target}",
+        f"-fuzztime={duration_seconds}s",
+    ]
 
     if corpus_dir:
-        args.extend(["--corpus-dir", corpus_dir])
+        cmd.append(f"-test.fuzzcachedir={corpus_dir}")
 
-    args.append(package)
+    cmd.append(package)
 
-    # Parse fuzz_time to determine subprocess timeout
-    fuzz_seconds = 30
     try:
-        if fuzz_time.endswith("h"):
-            fuzz_seconds = int(fuzz_time[:-1]) * 3600
-        elif fuzz_time.endswith("m"):
-            fuzz_seconds = int(fuzz_time[:-1]) * 60
-        elif fuzz_time.endswith("s"):
-            fuzz_seconds = int(fuzz_time[:-1])
-    except (ValueError, IndexError):
-        fuzz_seconds = 30
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
-    subprocess_timeout = fuzz_seconds + 60
-
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, lambda: _run_subprocess(args, timeout=subprocess_timeout))
-    result["tool"] = "run_fuzz"
-    result["config"] = {
-        "fuzz_target": fuzz_target,
-        "package": package,
-        "fuzz_time": fuzz_time,
-        "corpus_dir": corpus_dir
-    }
-    return result
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=float(duration_seconds + 60)
+            )
+            success = process.returncode == 0
+            return {
+                "status": "success" if success else "failed",
+                "returncode": process.returncode,
+                "stdout": stdout.decode(errors="replace"),
+                "stderr": stderr.decode(errors="replace"),
+                "command": " ".join(cmd),
+                "fuzz_target": fuzz_target,
+                "package": package,
+                "duration_seconds": duration_seconds,
+            }
+        except asyncio.TimeoutError:
+            process.kill()
+            return {
+                "status": "timeout",
+                "error": f"Fuzz run timed out after {duration_seconds + 60} seconds",
+                "command": " ".join(cmd),
+            }
+    except FileNotFoundError:
+        return {
+            "status": "error",
+            "error": "'go' binary not found. Please ensure Go is installed and available in PATH.",
+            "command": " ".join(cmd),
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "command": " ".join(cmd),
+        }
 
 
 @mcp.tool()
 async def get_version_info(
+    version_file: str = "build/version/version.txt",
     format: str = "text",
-    version_file: str = "build/version/version.txt"
 ) -> dict:
     """
-    Retrieve version information for the FerretDB build, including the version
-    string, git commit hash, build date, and Go runtime version. Use this to
-    verify which version is installed, inspect build metadata, or confirm a
-    build was successful.
+    Retrieve the current FerretDB version information from the build version file or binary.
+    Use this to check what version is built, verify release tags, or confirm build metadata.
     """
-    result = {
-        "tool": "get_version_info",
-        "format": format,
-        "version_file": version_file
-    }
+    result = {}
 
-    # Try reading the version file
-    version_content = None
-    if os.path.isfile(version_file):
+    version_path = Path(version_file)
+    if version_path.exists():
         try:
-            with open(version_file, "r") as f:
-                version_content = f.read().strip()
-            result["version_file_content"] = version_content
+            raw_version = version_path.read_text(encoding="utf-8").strip()
+            clean_version = raw_version.lstrip("v")
+            result["version_file"] = version_file
+            result["raw_version"] = raw_version
+            result["version"] = clean_version
         except Exception as e:
             result["version_file_error"] = str(e)
     else:
         result["version_file_error"] = f"Version file not found: {version_file}"
 
-    # Try running ferretdb --version
-    ferretdb_bin = shutil.which("ferretdb")
-    if not ferretdb_bin:
-        for candidate in ["./ferretdb", "./bin/ferretdb", "./build/ferretdb"]:
-            if os.path.isfile(candidate):
-                ferretdb_bin = candidate
-                break
+    if format == "json":
+        cmd = ["go", "run", "./cmd/envtool", "package-version", version_file]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30.0)
+            if process.returncode == 0:
+                version_str = stdout.decode(errors="replace").strip()
+                result["envtool_version"] = version_str
+                result["format"] = "json"
 
-    if ferretdb_bin:
-        version_args = [ferretdb_bin, "--version"]
-        if format == "json":
-            version_args.append("--json")
-        loop = asyncio.get_event_loop()
-        version_result = await loop.run_in_executor(
-            None, lambda: _run_subprocess(version_args, timeout=10)
-        )
-        result["ferretdb_version_output"] = version_result
+                git_cmd = ["git", "log", "-1", "--format=%H %ai"]
+                git_process = await asyncio.create_subprocess_exec(
+                    *git_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                git_stdout, _ = await asyncio.wait_for(git_process.communicate(), timeout=10.0)
+                if git_process.returncode == 0:
+                    parts = git_stdout.decode(errors="replace").strip().split(" ", 1)
+                    result["commit"] = parts[0] if parts else "unknown"
+                    result["build_date"] = parts[1] if len(parts) > 1 else "unknown"
+            else:
+                result["envtool_error"] = stderr.decode(errors="replace")
+        except asyncio.TimeoutError:
+            result["envtool_error"] = "Command timed out"
+        except FileNotFoundError:
+            result["envtool_error"] = "'go' binary not found"
+        except Exception as e:
+            result["envtool_error"] = str(e)
     else:
-        result["ferretdb_binary"] = "not found"
+        result["format"] = "text"
 
-    # Try running envtool version
-    envtool_bin = shutil.which("envtool")
-    if not envtool_bin:
-        for candidate in ["./envtool", "./bin/envtool"]:
-            if os.path.isfile(candidate):
-                envtool_bin = candidate
-                break
-
-    if envtool_bin:
-        envtool_args = [envtool_bin, "version"]
-        if format == "json":
-            envtool_args.append("--json")
-        loop = asyncio.get_event_loop()
-        envtool_result = await loop.run_in_executor(
-            None, lambda: _run_subprocess(envtool_args, timeout=10)
+    try:
+        ferretdb_process = await asyncio.create_subprocess_exec(
+            "ferretdb", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        result["envtool_version_output"] = envtool_result
-    else:
-        result["envtool_binary"] = "not found"
-
-    # Get Go version
-    loop = asyncio.get_event_loop()
-    go_result = await loop.run_in_executor(
-        None, lambda: _run_subprocess(["go", "version"], timeout=10)
-    )
-    result["go_version"] = go_result
+        fb_stdout, fb_stderr = await asyncio.wait_for(ferretdb_process.communicate(), timeout=10.0)
+        result["binary_version_output"] = (
+            fb_stdout.decode(errors="replace") or fb_stderr.decode(errors="replace")
+        ).strip()
+    except FileNotFoundError:
+        result["binary_note"] = "ferretdb binary not found in PATH"
+    except asyncio.TimeoutError:
+        result["binary_note"] = "ferretdb --version timed out"
+    except Exception as e:
+        result["binary_note"] = str(e)
 
     return result
 
 
 @mcp.tool()
-async def print_diagnostic_data(
+async def get_diagnostic_data(
     include_compose_logs: bool = True,
-    setup_error_message: Optional[str] = None,
-    output_file: Optional[str] = None
+    setup_error: Optional[str] = None,
+    output_file: Optional[str] = None,
 ) -> dict:
     """
-    Collect and display diagnostic information about the FerretDB environment,
-    including Docker Compose service logs and system state. Use this when debugging
-    test failures, setup issues, or unexpected server behavior to gather context
-    about what went wrong.
+    Collect and print diagnostic data about the FerretDB environment, including
+    Docker Compose service logs and system information. Use this when debugging
+    test failures, setup errors, or unexpected crashes.
     """
-    diagnostics = {
-        "tool": "print_diagnostic_data",
-        "setup_error_message": setup_error_message,
-        "output": {}
-    }
+    diagnostics = {}
 
-    loop = asyncio.get_event_loop()
+    async def run_cmd(cmd: List[str]) -> dict:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
+            return {
+                "returncode": process.returncode,
+                "stdout": stdout.decode(errors="replace"),
+                "stderr": stderr.decode(errors="replace"),
+            }
+        except FileNotFoundError:
+            return {"error": f"Command not found: {cmd[0]}"}
+        except asyncio.TimeoutError:
+            return {"error": f"Command timed out: {' '.join(cmd)}"}
+        except Exception as e:
+            return {"error": str(e)}
 
     if include_compose_logs:
-        compose_logs = await loop.run_in_executor(
-            None, lambda: _run_subprocess(["docker", "compose", "logs"], timeout=30)
+        diagnostics["compose_logs"] = await run_cmd(["docker", "compose", "logs"])
+        diagnostics["compose_ps"] = await run_cmd(["docker", "compose", "ps", "--all"])
+        diagnostics["docker_stats"] = await run_cmd(
+            ["docker", "stats", "--all", "--no-stream"]
         )
-        diagnostics["output"]["compose_logs"] = compose_logs
 
-        compose_ps = await loop.run_in_executor(
-            None, lambda: _run_subprocess(["docker", "compose", "ps", "--all"], timeout=30)
-        )
-        diagnostics["output"]["compose_ps"] = compose_ps
+    diagnostics["git_version"] = await run_cmd(["git", "version"])
+    diagnostics["docker_version"] = await run_cmd(["docker", "version"])
+    diagnostics["compose_version"] = await run_cmd(["docker", "compose", "version"])
+    diagnostics["go_version"] = await run_cmd(["go", "version"])
 
-        docker_stats = await loop.run_in_executor(
-            None, lambda: _run_subprocess(["docker", "stats", "--all", "--no-stream"], timeout=30)
-        )
-        diagnostics["output"]["docker_stats"] = docker_stats
+    diagnostics["goos"] = os.sys.platform
+    diagnostics["python_version"] = os.sys.version
 
-    # Git version
-    git_version = await loop.run_in_executor(
-        None, lambda: _run_subprocess(["git", "version"], timeout=10)
-    )
-    diagnostics["output"]["git_version"] = git_version
+    if setup_error:
+        diagnostics["setup_error"] = setup_error
 
-    # Docker version
-    docker_version = await loop.run_in_executor(
-        None, lambda: _run_subprocess(["docker", "version"], timeout=10)
-    )
-    diagnostics["output"]["docker_version"] = docker_version
-
-    # Docker compose version
-    compose_version = await loop.run_in_executor(
-        None, lambda: _run_subprocess(["docker", "compose", "version"], timeout=10)
-    )
-    diagnostics["output"]["compose_version"] = compose_version
-
-    # Go version
-    go_version = await loop.run_in_executor(
-        None, lambda: _run_subprocess(["go", "version"], timeout=10)
-    )
-    diagnostics["output"]["go_version"] = go_version
-
-    # Read version file if it exists
-    version_file = "build/version/version.txt"
-    if os.path.isfile(version_file):
+    version_path = Path("build/version/version.txt")
+    if version_path.exists():
         try:
-            with open(version_file, "r") as f:
-                diagnostics["output"]["ferretdb_version_file"] = f.read().strip()
+            diagnostics["ferretdb_version"] = version_path.read_text(encoding="utf-8").strip()
         except Exception as e:
-            diagnostics["output"]["ferretdb_version_file_error"] = str(e)
-
-    # Build summary output string
-    summary_lines = []
-    if setup_error_message:
-        summary_lines.append(f"Setup Error: {setup_error_message}")
-    for key, val in diagnostics["output"].items():
-        summary_lines.append(f"\n=== {key} ===")
-        if isinstance(val, dict):
-            if val.get("stdout"):
-                summary_lines.append(val["stdout"])
-            if val.get("stderr"):
-                summary_lines.append(f"STDERR: {val['stderr']}")
-        else:
-            summary_lines.append(str(val))
-
-    summary = "\n".join(summary_lines)
-    diagnostics["summary"] = summary
+            diagnostics["ferretdb_version_error"] = str(e)
 
     if output_file:
         try:
-            os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else ".", exist_ok=True)
-            with open(output_file, "w") as f:
-                f.write(summary)
-            diagnostics["written_to_file"] = output_file
+            output_path = Path(output_file)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(diagnostics, indent=2, default=str), encoding="utf-8"
+            )
+            diagnostics["output_written_to"] = output_file
         except Exception as e:
-            diagnostics["file_write_error"] = str(e)
+            diagnostics["output_file_error"] = str(e)
 
     return diagnostics
 
 
 @mcp.tool()
-async def shell_operations(
-    operation: str,
-    paths: list
+async def manage_shell_paths(
+    action: str,
+    paths: List[str],
+    recursive: bool = True,
 ) -> dict:
     """
-    Perform shell utility operations used during environment management: create
-    directories, remove directories, or read file contents. Use this to manage
-    the FerretDB build/test environment file system, such as creating test output
-    directories or reading configuration files.
+    Create or remove directories using envtool shell path utilities.
+    Use this to set up required directory structures for test data, build artifacts,
+    or temporary files, or to clean them up after test runs.
+    Actions: 'mkdir' to create directories, 'rmdir' to remove directories,
+    or 'read' to read a file's contents.
     """
-    if not paths:
-        return {
-            "success": False,
-            "error": "No paths provided",
-            "operation": operation
-        }
-
     results = []
-    overall_success = True
+    errors = []
 
-    if operation == "mkdir":
+    if action == "mkdir":
         for path in paths:
             try:
-                os.makedirs(path, exist_ok=True)
-                results.append({"path": path, "success": True, "message": f"Directory created: {path}"})
-            except Exception as e:
-                results.append({"path": path, "success": False, "error": str(e)})
-                overall_success = False
-
-    elif operation == "rmdir":
-        for path in paths:
-            try:
-                if os.path.exists(path):
-                    shutil.rmtree(path)
-                    results.append({"path": path, "success": True, "message": f"Directory removed: {path}"})
+                p = Path(path)
+                if recursive:
+                    p.mkdir(parents=True, exist_ok=True)
                 else:
-                    results.append({"path": path, "success": True, "message": f"Directory did not exist: {path}"})
+                    p.mkdir(exist_ok=True)
+                results.append({"path": path, "status": "created", "exists": p.exists()})
             except Exception as e:
-                results.append({"path": path, "success": False, "error": str(e)})
-                overall_success = False
+                errors.append({"path": path, "error": str(e)})
 
-    elif operation == "read":
+    elif action == "rmdir":
+        import shutil
         for path in paths:
             try:
-                if not os.path.isfile(path):
-                    results.append({"path": path, "success": False, "error": f"File not found: {path}"})
-                    overall_success = False
+                p = Path(path)
+                if not p.exists():
+                    results.append({"path": path, "status": "not_found_skipped"})
                     continue
-                with open(path, "r", errors="replace") as f:
-                    content = f.read()
-                results.append({"path": path, "success": True, "content": content})
+                if recursive:
+                    shutil.rmtree(str(p))
+                else:
+                    p.rmdir()
+                results.append({"path": path, "status": "removed", "exists": p.exists()})
             except Exception as e:
-                results.append({"path": path, "success": False, "error": str(e)})
-                overall_success = False
+                errors.append({"path": path, "error": str(e)})
+
+    elif action == "read":
+        for path in paths:
+            try:
+                p = Path(path)
+                if not p.exists():
+                    errors.append({"path": path, "error": "File not found"})
+                    continue
+                content = p.read_text(encoding="utf-8")
+                results.append({"path": path, "status": "read", "content": content})
+            except Exception as e:
+                errors.append({"path": path, "error": str(e)})
+
     else:
         return {
-            "success": False,
-            "error": f"Unknown operation: '{operation}'. Must be one of: mkdir, rmdir, read",
-            "operation": operation
+            "status": "error",
+            "error": f"Unknown action '{action}'. Valid actions are: mkdir, rmdir, read",
         }
 
     return {
-        "success": overall_success,
-        "operation": operation,
-        "results": results
+        "status": "success" if not errors else "partial_failure",
+        "action": action,
+        "recursive": recursive,
+        "results": results,
+        "errors": errors,
+        "total": len(paths),
+        "succeeded": len(results),
+        "failed": len(errors),
     }
 
 
 
 
-# Browser-friendly entrypoint
+# ── Browser-friendly entrypoint ──────────────────────────────
+async def _health(request):
+    return JSONResponse({"status": "ok", "server": mcp.name, "mcp_endpoint": "/mcp"})
+
 async def _browser_mcp(request):
+    """Return server info when /mcp is opened in a browser (GET without SSE accept)."""
     tools = []
     try:
         for t in mcp._tool_manager._tools.values():
@@ -603,18 +531,19 @@ async def _browser_mcp(request):
         "endpoint": "/mcp",
         "tools": tools,
         "tool_count": len(tools),
-        "usage": "Connect with an MCP client (Claude Desktop, Cursor, etc.) using this URL."
+        "usage": "Connect with an MCP client (Claude Desktop, Cursor, etc.) using this URL as the server endpoint."
     })
 
 class _BrowserFallbackMiddleware:
+    """Intercept browser GETs to /mcp before they hit FastMCP's handler."""
     def __init__(self, app):
         self.app = app
     async def __call__(self, scope, receive, send):
         if (scope["type"] == "http"
             and scope["path"] == "/mcp"
             and scope["method"] == "GET"):
-            hdrs = dict(scope.get("headers", []))
-            accept = hdrs.get(b"accept", b"").decode()
+            headers = dict(scope.get("headers", []))
+            accept = headers.get(b"accept", b"").decode()
             if "text/event-stream" not in accept:
                 from starlette.requests import Request
                 req = Request(scope, receive)
