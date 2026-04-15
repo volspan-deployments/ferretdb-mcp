@@ -449,7 +449,8 @@ async def get_diagnostic_data(
     # Compile full output
     output_lines = ["=== FerretDB Diagnostic Data ==="]
     for key, val in diagnostic_results.items():
-        output_lines.append(f"\n--- {key} ---")
+        output_lines.append(f"
+--- {key} ---")
         if isinstance(val, dict):
             if val.get("stdout"):
                 output_lines.append(val["stdout"])
@@ -460,7 +461,8 @@ async def get_diagnostic_data(
         else:
             output_lines.append(str(val))
 
-    full_output = "\n".join(output_lines)
+    full_output = "
+".join(output_lines)
 
     if output_file:
         try:
@@ -489,4 +491,4 @@ async def get_diagnostic_data(
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))))
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=int(os.environ.get("PORT", 8000))))
