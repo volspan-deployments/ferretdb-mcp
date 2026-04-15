@@ -1,8 +1,7 @@
+import uvicorn
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from starlette.responses import JSONResponse
-from starlette.middleware import Middleware
-import uvicorn
 from fastmcp import FastMCP
 import subprocess
 import os
@@ -583,51 +582,24 @@ async def manage_shell_paths(
         "results": results,
     }
 
+async def health(request):
+    return JSONResponse({"status": "ok", "server": mcp.name})
 
+async def tools(request):
+    registered = await mcp.list_tools()
+    tool_list = [{"name": t.name, "description": t.description or ""} for t in registered]
+    return JSONResponse({"tools": tool_list, "count": len(tool_list)})
 
+mcp_app = mcp.http_app(transport="streamable-http")
 
-# ── Browser-friendly entrypoint ──────────────────────────────
-async def _health(request):
-    return JSONResponse({"status": "ok", "server": mcp.name, "mcp_endpoint": "/mcp"})
-
-async def _browser_mcp(request):
-    """Return server info when /mcp is opened in a browser (GET without SSE accept)."""
-    tools = []
-    try:
-        for t in mcp._tool_manager._tools.values():
-            tools.append({"name": t.name, "description": t.description or ""})
-    except Exception:
-        pass
-    return JSONResponse({
-        "server": mcp.name,
-        "protocol": "MCP (Model Context Protocol)",
-        "transport": "streamable-http",
-        "endpoint": "/mcp",
-        "tools": tools,
-        "tool_count": len(tools),
-        "usage": "Connect with an MCP client (Claude Desktop, Cursor, etc.) using this URL as the server endpoint."
-    })
-
-class _BrowserFallbackMiddleware:
-    """Intercept browser GETs to /mcp before they hit FastMCP's handler."""
-    def __init__(self, app):
-        self.app = app
-    async def __call__(self, scope, receive, send):
-        if (scope["type"] == "http"
-            and scope["path"] == "/mcp"
-            and scope["method"] == "GET"):
-            headers = dict(scope.get("headers", []))
-            accept = headers.get(b"accept", b"").decode()
-            if "text/event-stream" not in accept:
-                from starlette.requests import Request
-                req = Request(scope, receive)
-                resp = await _browser_mcp(req)
-                await resp(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
-
-_mcp_asgi = mcp.streamable_http_app()
-app = _BrowserFallbackMiddleware(_mcp_asgi)
+app = Starlette(
+    routes=[
+        Route("/health", health),
+        Route("/tools", tools),
+        Mount("/", mcp_app),
+    ],
+    lifespan=mcp_app.lifespan,
+)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
