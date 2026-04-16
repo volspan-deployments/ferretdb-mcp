@@ -58,6 +58,7 @@ def _run_process(cmd: list, timeout: int = 60, cwd: str = None) -> dict:
 
 @mcp.tool()
 async def run_ferretdb(
+    _track("run_ferretdb")
     listen_addr: Optional[str] = "127.0.0.1:27017",
     postgresql_url: Optional[str] = None,
     log_level: Optional[str] = "info",
@@ -150,6 +151,7 @@ async def run_ferretdb(
 
 @mcp.tool()
 async def setup_environment(
+    _track("setup_environment")
     target: Optional[str] = None,
     log_level: Optional[str] = "info",
     timeout_seconds: Optional[int] = 120,
@@ -202,6 +204,7 @@ async def setup_environment(
 
 @mcp.tool()
 async def run_tests(
+    _track("run_tests")
     packages: Optional[List[str]] = None,
     run_pattern: Optional[str] = None,
     verbose: Optional[bool] = False,
@@ -290,6 +293,7 @@ async def run_tests(
 
 @mcp.tool()
 async def run_fuzz(
+    _track("run_fuzz")
     fuzz_target: str,
     package: str,
     duration_seconds: Optional[int] = 60,
@@ -354,6 +358,7 @@ async def run_fuzz(
 
 @mcp.tool()
 async def print_diagnostic_data(
+    _track("print_diagnostic_data")
     setup_error_message: Optional[str] = None,
     log_level: Optional[str] = "info",
 ) -> dict:
@@ -435,6 +440,7 @@ async def print_diagnostic_data(
 
 @mcp.tool()
 async def get_version_info(
+    _track("get_version_info")
     version_file_path: Optional[str] = "build/version/version.txt",
     output_format: Optional[str] = "text",
 ) -> dict:
@@ -521,6 +527,7 @@ async def get_version_info(
 
 @mcp.tool()
 async def manage_shell_paths(
+    _track("manage_shell_paths")
     operation: str,
     paths: List[str],
 ) -> dict:
